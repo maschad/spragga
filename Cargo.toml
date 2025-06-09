@@ -1,6 +1,16 @@
 [package]
 name = "spray"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
 
 [dependencies]
+crossbeam-epoch = "0.9"
+rand = "0.8"
+parking_lot = "0.12"
+
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "spraylist_bench"
+harness = false
