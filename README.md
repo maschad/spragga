@@ -1,4 +1,4 @@
-# SprayList
+# Spray
 
 A Rust implementation of the SprayList data structure - a scalable concurrent priority queue with relaxed ordering semantics.
 
