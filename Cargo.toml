@@ -2,6 +2,12 @@
 name = "spray"
 version = "0.1.0"
 edition = "2021"
+description = "A scalable concurrent priority queue with relaxed ordering semantics"
+authors = ["Your Name <your.email@example.com>"]
+license = "MIT"
+repository = "https://github.com/your-username/spray"
+keywords = ["priority-queue", "concurrent", "lock-free", "data-structures", "skip-list"]
+categories = ["data-structures", "concurrency"]
 
 [dev-dependencies]
 criterion = "0.6.0"
