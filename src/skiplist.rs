@@ -1,11 +1,14 @@
-//! Lock-free skiplist implementation based on Fraser's algorithm
+//! Lock-free skiplist implementation using std library atomics
+//! Based on Fraser's algorithm with pointer marking for node deletion
 
-use crossbeam_epoch::{self as epoch, Atomic, Guard, Owned, Shared};
 use std::cmp::Ordering;
-use std::ptr;
-use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+use std::ptr::{self};
+use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering as AtomicOrdering};
 
 const MAX_LEVEL: usize = 32;
+
+/// Type alias for the result of find operation
+type FindResult<K, V> = (Vec<*mut Node<K, V>>, Vec<*mut Node<K, V>>);
 
 /// A node in the skiplist
 #[derive(Debug)]
@@ -13,7 +16,7 @@ pub struct Node<K, V> {
     pub key: K,
     pub value: V,
     pub level: usize,
-    pub next: Vec<Atomic<Node<K, V>>>,
+    pub next: Vec<AtomicPtr<Node<K, V>>>,
 }
 
 impl<K, V> Node<K, V> {
@@ -21,7 +24,7 @@ impl<K, V> Node<K, V> {
     pub fn new(key: K, value: V, level: usize) -> Self {
         let mut next = Vec::with_capacity(level + 1);
         for _ in 0..=level {
-            next.push(Atomic::null());
+            next.push(AtomicPtr::new(ptr::null_mut()));
         }
         Self {
             key,
@@ -31,28 +34,28 @@ impl<K, V> Node<K, V> {
         }
     }
 
-    /// Mark a pointer for deletion
+    /// Mark a pointer for deletion by setting the least significant bit
     pub fn mark_tower(&self) -> bool {
         for level in (0..=self.level).rev() {
-            let mut next = unsafe { self.next[level].load(AtomicOrdering::SeqCst, epoch::unprotected()) };
+            let mut next = self.next[level].load(AtomicOrdering::SeqCst);
             loop {
-                if next.tag() & 1 != 0 {
+                // Check if already marked (LSB = 1)
+                if (next as usize) & 1 != 0 {
                     if level == 0 {
-                        return false;
+                        return false; // Already marked
                     }
                     break;
                 }
-                match unsafe {
-                    self.next[level].compare_exchange(
-                        next,
-                        next.with_tag(next.tag() | 1),
-                        AtomicOrdering::SeqCst,
-                        AtomicOrdering::SeqCst,
-                        epoch::unprotected(),
-                    )
-                } {
+                // Try to mark by setting LSB
+                let marked = ((next as usize) | 1) as *mut Self;
+                match self.next[level].compare_exchange(
+                    next,
+                    marked,
+                    AtomicOrdering::SeqCst,
+                    AtomicOrdering::SeqCst,
+                ) {
                     Ok(_) => break,
-                    Err(e) => next = e.current,
+                    Err(current) => next = current,
                 }
             }
         }
@@ -60,18 +63,39 @@ impl<K, V> Node<K, V> {
     }
 }
 
+/// Helper functions for pointer marking
+#[inline]
+pub fn is_marked<K, V>(ptr: *mut Node<K, V>) -> bool {
+    (ptr as usize) & 1 != 0
+}
+
+#[inline]
+pub fn unmark<K, V>(ptr: *mut Node<K, V>) -> *mut Node<K, V> {
+    ((ptr as usize) & !1) as *mut Node<K, V>
+}
+
+#[inline]
+pub fn mark<K, V>(ptr: *mut Node<K, V>) -> *mut Node<K, V> {
+    ((ptr as usize) | 1) as *mut Node<K, V>
+}
+
 /// A lock-free skiplist
 pub struct SkipList<K, V> {
-    head: Atomic<Node<K, V>>,
+    head: AtomicPtr<Node<K, V>>,
     size: AtomicUsize,
 }
 
 impl<K: Ord + Default + Clone, V: Default + Clone> SkipList<K, V> {
     /// Create a new empty skiplist
+    #[must_use]
     pub fn new() -> Self {
-        let head = Node::new(K::default(), V::default(), MAX_LEVEL - 1);
+        let head = Box::into_raw(Box::new(Node::new(
+            K::default(),
+            V::default(),
+            MAX_LEVEL - 1,
+        )));
         Self {
-            head: Atomic::new(head),
+            head: AtomicPtr::new(head),
             size: AtomicUsize::new(0),
         }
     }
@@ -86,55 +110,76 @@ impl<K: Ord + Default + Clone, V: Default + Clone> SkipList<K, V> {
         self.len() == 0
     }
 
-    /// Generate a random level for a new node
+    /// Generate a random level for a new node using our own RNG
     fn random_level() -> usize {
-        let mut level = 0;
-        while level < MAX_LEVEL - 1 && rand::random::<bool>() {
-            level += 1;
+        use crate::rng::MarsagliaXOR;
+        thread_local! {
+            static RNG: std::cell::RefCell<MarsagliaXOR> = std::cell::RefCell::new({
+                use std::collections::hash_map::DefaultHasher;
+                use std::hash::{Hash, Hasher};
+                let mut hasher = DefaultHasher::new();
+                std::thread::current().id().hash(&mut hasher);
+                #[allow(clippy::cast_possible_truncation)]
+                MarsagliaXOR::new((hasher.finish() as u32).wrapping_mul(17))
+            });
         }
-        level
+
+        RNG.with(|rng_cell| {
+            let mut rng = rng_cell.borrow_mut();
+            let mut level = 0;
+            while level < MAX_LEVEL - 1 && (rng.next() & 1) == 1 {
+                level += 1;
+            }
+            level
+        })
     }
 
-    /// Find the position where a key should be inserted
-    pub fn find<'g>(&self, key: &K, guard: &'g Guard) -> (Vec<Shared<'g, Node<K, V>>>, Vec<Shared<'g, Node<K, V>>>) {
-        let mut preds = vec![Shared::null(); MAX_LEVEL];
-        let mut succs = vec![Shared::null(); MAX_LEVEL];
+    /// Find the position where a key should be inserted (Fraser's search)
+    pub fn find(&self, key: &K) -> FindResult<K, V> {
+        let mut preds = vec![ptr::null_mut(); MAX_LEVEL];
+        let mut succs = vec![ptr::null_mut(); MAX_LEVEL];
 
         'retry: loop {
-            let mut pred = self.head.load(AtomicOrdering::SeqCst, guard);
-            
+            let mut pred = self.head.load(AtomicOrdering::SeqCst);
+
             for level in (0..MAX_LEVEL).rev() {
-                let mut curr = unsafe { pred.deref() }.next[level].load(AtomicOrdering::SeqCst, guard);
-                
+                let mut curr = unsafe { &*pred }.next[level].load(AtomicOrdering::SeqCst);
+
                 loop {
                     if curr.is_null() {
                         break;
                     }
 
-                    let curr_node = unsafe { curr.deref() };
-                    let next = curr_node.next[level].load(AtomicOrdering::SeqCst, guard);
+                    // Remove mark bit for comparison
+                    let curr_clean = unmark(curr);
+                    if curr_clean.is_null() {
+                        break;
+                    }
+
+                    let curr_node = unsafe { &*curr_clean };
+                    let next = curr_node.next[level].load(AtomicOrdering::SeqCst);
 
                     // Skip marked nodes
-                    if next.tag() & 1 != 0 {
-                        if unsafe { pred.deref() }.next[level]
+                    if is_marked(next) {
+                        let next_clean = unmark(next);
+                        if unsafe { &*pred }.next[level]
                             .compare_exchange(
                                 curr,
-                                next.with_tag(0),
+                                next_clean,
                                 AtomicOrdering::SeqCst,
                                 AtomicOrdering::SeqCst,
-                                guard,
                             )
                             .is_err()
                         {
                             continue 'retry;
                         }
-                        curr = next.with_tag(0);
+                        curr = next_clean;
                         continue;
                     }
 
                     match curr_node.key.cmp(key) {
                         Ordering::Less => {
-                            pred = curr;
+                            pred = curr_clean;
                             curr = next;
                         }
                         _ => break,
@@ -142,7 +187,7 @@ impl<K: Ord + Default + Clone, V: Default + Clone> SkipList<K, V> {
                 }
 
                 preds[level] = pred;
-                succs[level] = curr;
+                succs[level] = unmark(curr);
             }
 
             return (preds, succs);
@@ -150,84 +195,93 @@ impl<K: Ord + Default + Clone, V: Default + Clone> SkipList<K, V> {
     }
 
     /// Insert a key-value pair into the skiplist
-    pub fn insert(&self, key: K, value: V, guard: &Guard) -> bool {
+    pub fn insert(&self, key: &K, value: &V) -> bool {
         let level = Self::random_level();
-        let key_clone = key.clone();
-        
+
         loop {
-            let (mut preds, mut succs) = self.find(&key_clone, guard);
+            let (preds, succs) = self.find(key);
 
             // Check if key already exists
-            if !succs[0].is_null() && unsafe { succs[0].deref() }.key == key_clone {
+            if !succs[0].is_null() && unsafe { &*succs[0] }.key == *key {
                 return false;
             }
 
             // Create new node
-            let new_node = Owned::new(Node::new(key.clone(), value.clone(), level))
-                .into_shared(guard);
-            let new_node_ref = unsafe { new_node.deref() };
+            let new_node = Box::into_raw(Box::new(Node::new(key.clone(), value.clone(), level)));
+            let new_node_ref = unsafe { &*new_node };
 
             // Set next pointers
-            for i in 0..=level {
-                new_node_ref.next[i].store(succs[i], AtomicOrdering::SeqCst);
+            for (i, succ) in succs.iter().enumerate().take(level + 1) {
+                new_node_ref.next[i].store(*succ, AtomicOrdering::SeqCst);
             }
 
-            // Try to link at level 0
-            match unsafe { preds[0].deref() }.next[0].compare_exchange(
+            // Try to link at level 0 first
+            match unsafe { &*preds[0] }.next[0].compare_exchange(
                 succs[0],
                 new_node,
                 AtomicOrdering::SeqCst,
                 AtomicOrdering::SeqCst,
-                guard,
             ) {
                 Ok(_) => {
-                    // Link at higher levels
+                    // Successfully linked at level 0, now link at higher levels
                     for i in 1..=level {
                         loop {
-                            let pred = &unsafe { preds[i].deref() }.next[i];
-                            if new_node_ref.next[i].load(AtomicOrdering::SeqCst, guard).tag() & 1 != 0 {
+                            let pred = &unsafe { &*preds[i] }.next[i];
+                            let curr_next = new_node_ref.next[i].load(AtomicOrdering::SeqCst);
+
+                            // If our node got marked, give up on higher levels
+                            if is_marked(curr_next) {
                                 break;
                             }
-                            
-                            if pred.compare_exchange(
-                                succs[i],
-                                new_node,
-                                AtomicOrdering::SeqCst,
-                                AtomicOrdering::SeqCst,
-                                guard,
-                            ).is_ok() {
+
+                            if pred
+                                .compare_exchange(
+                                    succs[i],
+                                    new_node,
+                                    AtomicOrdering::SeqCst,
+                                    AtomicOrdering::SeqCst,
+                                )
+                                .is_ok()
+                            {
                                 break;
                             }
-                            
+
                             // Retry find for this level
-                            let (new_preds, new_succs) = self.find(&new_node_ref.key, guard);
-                            preds[i] = new_preds[i];
-                            succs[i] = new_succs[i];
+                            let (new_preds, new_succs) = self.find(&new_node_ref.key);
+                            if i < new_preds.len() && i < new_succs.len() {
+                                // Update for this specific level and retry
+                                new_node_ref.next[i].store(new_succs[i], AtomicOrdering::SeqCst);
+                                if new_preds[i] != preds[i] {
+                                    break; // Topology changed, stop trying higher levels
+                                }
+                            } else {
+                                break;
+                            }
                         }
                     }
-                    
+
                     self.size.fetch_add(1, AtomicOrdering::Relaxed);
                     return true;
                 }
                 Err(_) => {
-                    // Retry
-                    unsafe { guard.defer_destroy(new_node) };
+                    // Clean up and retry
+                    unsafe { drop(Box::from_raw(new_node)) };
                 }
             }
         }
     }
 
     /// Remove a key from the skiplist
-    pub fn remove(&self, key: &K, guard: &Guard) -> Option<V> {
+    pub fn remove(&self, key: &K) -> Option<V> {
         loop {
-            let (preds, succs) = self.find(key, guard);
+            let (preds, succs) = self.find(key);
 
-            if succs[0].is_null() || unsafe { succs[0].deref() }.key != *key {
+            if succs[0].is_null() || unsafe { &*succs[0] }.key != *key {
                 return None;
             }
 
-            let node = unsafe { succs[0].deref() };
-            
+            let node = unsafe { &*succs[0] };
+
             // Mark the node for deletion
             if !node.mark_tower() {
                 continue;
@@ -235,29 +289,31 @@ impl<K: Ord + Default + Clone, V: Default + Clone> SkipList<K, V> {
 
             // Try to unlink at all levels
             for level in (0..=node.level).rev() {
-                let _ = unsafe { preds[level].deref() }.next[level].compare_exchange(
+                let next = node.next[level].load(AtomicOrdering::SeqCst);
+                let next_clean = unmark(next);
+
+                let _ = unsafe { &*preds[level] }.next[level].compare_exchange(
                     succs[level],
-                    node.next[level].load(AtomicOrdering::SeqCst, guard).with_tag(0),
+                    next_clean,
                     AtomicOrdering::SeqCst,
                     AtomicOrdering::SeqCst,
-                    guard,
                 );
             }
 
             self.size.fetch_sub(1, AtomicOrdering::Relaxed);
-            
-            // We can't safely return the value due to memory management
-            // In a real implementation, we'd need to handle this differently
-            return Some(unsafe { ptr::read(&node.value) });
+
+            // We can't safely return the value due to potential concurrent access
+            // In a real implementation, we'd need hazard pointers or epoch-based reclamation
+            return Some(node.value.clone());
         }
     }
 
-    /// Get a reference to the first node (for SprayList operations)
-    pub fn head(&self) -> Shared<Node<K, V>> {
-        unsafe { self.head.load(AtomicOrdering::SeqCst, epoch::unprotected()) }
+    /// Get a reference to the head node (for `SprayList` operations)
+    pub fn head(&self) -> *mut Node<K, V> {
+        self.head.load(AtomicOrdering::SeqCst)
     }
-    
-    /// Decrement the size counter (for SprayList operations)
+
+    /// Decrement the size counter (for `SprayList` operations)
     pub fn decrement_size(&self) {
         self.size.fetch_sub(1, AtomicOrdering::Relaxed);
     }
@@ -269,6 +325,11 @@ impl<K: Ord + Default + Clone, V: Default + Clone> Default for SkipList<K, V> {
     }
 }
 
-// Safety: SkipList is thread-safe
+// Memory management note: In a production implementation, we would need
+// proper hazard pointers or epoch-based reclamation to safely reclaim memory.
+// For this educational implementation, we're accepting potential memory leaks
+// to focus on the SprayList algorithm itself.
+
+// Safety: SkipList is thread-safe through atomic operations
 unsafe impl<K: Send + Sync, V: Send + Sync> Send for SkipList<K, V> {}
 unsafe impl<K: Send + Sync, V: Send + Sync> Sync for SkipList<K, V> {}

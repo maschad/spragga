@@ -3,14 +3,13 @@ name = "spray"
 version = "0.1.0"
 edition = "2021"
 
-[dependencies]
-crossbeam-epoch = "0.9"
-rand = "0.8"
-parking_lot = "0.12"
-
 [dev-dependencies]
-criterion = "0.5"
+criterion = "0.6.0"
 
 [[bench]]
 name = "spraylist_bench"
 harness = false
+
+[[bin]]
+name = "throughput_test"
+path = "src/bin/throughput_test.rs"
