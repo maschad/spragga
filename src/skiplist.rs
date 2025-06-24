@@ -140,10 +140,10 @@ impl<K: Ord + Default + Clone, V: Default + Clone> SkipList<K, V> {
         let mut succs = vec![ptr::null_mut(); MAX_LEVEL];
 
         'retry: loop {
-            let mut pred = self.head.load(AtomicOrdering::SeqCst);
+            let mut pred = self.head.load(AtomicOrdering::Acquire);
 
             for level in (0..MAX_LEVEL).rev() {
-                let mut curr = unsafe { &*pred }.next[level].load(AtomicOrdering::SeqCst);
+                let mut curr = unsafe { &*pred }.next[level].load(AtomicOrdering::Acquire);
 
                 loop {
                     if curr.is_null() {
@@ -157,7 +157,7 @@ impl<K: Ord + Default + Clone, V: Default + Clone> SkipList<K, V> {
                     }
 
                     let curr_node = unsafe { &*curr_clean };
-                    let next = curr_node.next[level].load(AtomicOrdering::SeqCst);
+                    let next = curr_node.next[level].load(AtomicOrdering::Acquire);
 
                     // Skip marked nodes
                     if is_marked(next) {
@@ -166,8 +166,8 @@ impl<K: Ord + Default + Clone, V: Default + Clone> SkipList<K, V> {
                             .compare_exchange(
                                 curr,
                                 next_clean,
-                                AtomicOrdering::SeqCst,
-                                AtomicOrdering::SeqCst,
+                                AtomicOrdering::AcqRel,
+                                AtomicOrdering::Acquire,
                             )
                             .is_err()
                         {
@@ -212,22 +212,22 @@ impl<K: Ord + Default + Clone, V: Default + Clone> SkipList<K, V> {
 
             // Set next pointers
             for (i, succ) in succs.iter().enumerate().take(level + 1) {
-                new_node_ref.next[i].store(*succ, AtomicOrdering::SeqCst);
+                new_node_ref.next[i].store(*succ, AtomicOrdering::Release);
             }
 
             // Try to link at level 0 first
             match unsafe { &*preds[0] }.next[0].compare_exchange(
                 succs[0],
                 new_node,
-                AtomicOrdering::SeqCst,
-                AtomicOrdering::SeqCst,
+                AtomicOrdering::AcqRel,
+                AtomicOrdering::Acquire,
             ) {
                 Ok(_) => {
                     // Successfully linked at level 0, now link at higher levels
                     for i in 1..=level {
                         loop {
                             let pred = &unsafe { &*preds[i] }.next[i];
-                            let curr_next = new_node_ref.next[i].load(AtomicOrdering::SeqCst);
+                            let curr_next = new_node_ref.next[i].load(AtomicOrdering::Acquire);
 
                             // If our node got marked, give up on higher levels
                             if is_marked(curr_next) {
@@ -238,8 +238,8 @@ impl<K: Ord + Default + Clone, V: Default + Clone> SkipList<K, V> {
                                 .compare_exchange(
                                     succs[i],
                                     new_node,
-                                    AtomicOrdering::SeqCst,
-                                    AtomicOrdering::SeqCst,
+                                    AtomicOrdering::AcqRel,
+                                    AtomicOrdering::Acquire,
                                 )
                                 .is_ok()
                             {
@@ -250,7 +250,7 @@ impl<K: Ord + Default + Clone, V: Default + Clone> SkipList<K, V> {
                             let (new_preds, new_succs) = self.find(&new_node_ref.key);
                             if i < new_preds.len() && i < new_succs.len() {
                                 // Update for this specific level and retry
-                                new_node_ref.next[i].store(new_succs[i], AtomicOrdering::SeqCst);
+                                new_node_ref.next[i].store(new_succs[i], AtomicOrdering::Release);
                                 if new_preds[i] != preds[i] {
                                     break; // Topology changed, stop trying higher levels
                                 }
@@ -289,14 +289,14 @@ impl<K: Ord + Default + Clone, V: Default + Clone> SkipList<K, V> {
 
             // Try to unlink at all levels
             for level in (0..=node.level).rev() {
-                let next = node.next[level].load(AtomicOrdering::SeqCst);
+                let next = node.next[level].load(AtomicOrdering::Acquire);
                 let next_clean = unmark(next);
 
                 let _ = unsafe { &*preds[level] }.next[level].compare_exchange(
                     succs[level],
                     next_clean,
-                    AtomicOrdering::SeqCst,
-                    AtomicOrdering::SeqCst,
+                    AtomicOrdering::AcqRel,
+                    AtomicOrdering::Acquire,
                 );
             }
 
@@ -310,7 +310,7 @@ impl<K: Ord + Default + Clone, V: Default + Clone> SkipList<K, V> {
 
     /// Get a reference to the head node (for `SprayList` operations)
     pub fn head(&self) -> *mut Node<K, V> {
-        self.head.load(AtomicOrdering::SeqCst)
+        self.head.load(AtomicOrdering::Acquire)
     }
 
     /// Decrement the size counter (for `SprayList` operations)

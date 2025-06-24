@@ -1,4 +1,151 @@
-//! `SprayList`: A scalable relaxed priority queue
+//! A scalable relaxed priority queue implementation.
+//!
+//! This module provides the [`SprayList`] data structure, a concurrent priority queue
+//! based on the `SprayList` algorithm from the paper ["The SprayList: A Scalable Relaxed
+//! Priority Queue"](https://www.microsoft.com/en-us/research/wp-content/uploads/2016/02/SprayList_full.pdf).
+//!
+//! ## Overview
+//!
+//! Traditional priority queues become bottlenecks under high concurrency due to
+//! contention at the head of the queue. `SprayList` solves this by implementing
+//! *relaxed semantics*: instead of always returning the exact minimum element,
+//! [`delete_min()`](SprayList::delete_min) returns an element from among the
+//! first O(p log³ p) smallest elements, where p is the number of threads.
+//!
+//! This relaxation enables exceptional concurrent scalability while maintaining
+//! reasonable ordering guarantees for most applications.
+//!
+//! ## Key Features
+//!
+//! - **Lock-free**: Built on top of a non-blocking skip list
+//! - **Scalable**: Avoids sequential bottlenecks through randomized "spray" traversal
+//! - **Thread-safe**: All operations can be called concurrently from multiple threads
+//! - **Configurable**: Spray parameters can be tuned for specific workloads
+//! - **Fallback mechanism**: Periodically falls back to exact minimum for ordering guarantees
+//!
+//! ## Performance Characteristics
+//!
+//! - **Insert**: O(log n) expected time
+//! - **`DeleteMin`**: O(log³ p) expected time, independent of list size
+//! - **Space**: O(n) expected space
+//! - **Scalability**: Maintains high throughput even with 16+ concurrent threads
+//!
+//! ## When to Use `SprayList`
+//!
+//! `SprayList` is ideal for applications that:
+//! - Need high-throughput priority queue operations under concurrent access
+//! - Can tolerate approximate priority ordering (relaxed semantics)
+//! - Experience performance bottlenecks with traditional concurrent priority queues
+//!
+//! **Good use cases:**
+//! - Task scheduling systems
+//! - Event simulation engines
+//! - Load balancing systems
+//! - Real-time systems where throughput > strict ordering
+//!
+//! **Avoid `SprayList` when:**
+//! - Exact ordering is critical to correctness
+//! - Single-threaded or low-concurrency access patterns
+//! - Small queue sizes where contention is not an issue
+//!
+//! ## Basic Example
+//!
+//! ```
+//! use spray::SprayList;
+//!
+//! let spray = SprayList::new();
+//!
+//! // Insert elements
+//! spray.insert(&5, &"five");
+//! spray.insert(&1, &"one");
+//! spray.insert(&3, &"three");
+//! spray.insert(&7, &"seven");
+//!
+//! // Delete min returns elements in approximately sorted order
+//! while let Some((key, value)) = spray.delete_min() {
+//!     println!("Removed: {} -> {}", key, value);
+//! }
+//! ```
+//!
+//! ## Concurrent Example
+//!
+//! ```
+//! use spray::SprayList;
+//! use std::sync::Arc;
+//! use std::thread;
+//!
+//! let spray = Arc::new(SprayList::new());
+//! spray.set_num_threads(4); // Optimize for 4 threads
+//!
+//! let mut handles = vec![];
+//!
+//! // Spawn threads to insert values concurrently
+//! for i in 0..4 {
+//!     let spray_clone = spray.clone();
+//!     let handle = thread::spawn(move || {
+//!         for j in 0..100 {
+//!             let key = i * 100 + j;
+//!             spray_clone.insert(&key, &format!("thread-{}-item-{}", i, j));
+//!         }
+//!     });
+//!     handles.push(handle);
+//! }
+//!
+//! // Wait for all insertions
+//! for handle in handles {
+//!     handle.join().unwrap();
+//! }
+//!
+//! println!("Inserted {} elements", spray.len());
+//!
+//! // Multiple threads can delete concurrently
+//! let mut handles = vec![];
+//! for _ in 0..4 {
+//!     let spray_clone = spray.clone();
+//!     let handle = thread::spawn(move || {
+//!         let mut count = 0;
+//!         while spray_clone.delete_min().is_some() {
+//!             count += 1;
+//!         }
+//!         count
+//!     });
+//!     handles.push(handle);
+//! }
+//!
+//! let total_deleted: usize = handles.into_iter()
+//!     .map(|h| h.join().unwrap())
+//!     .sum();
+//!
+//! println!("Total deleted: {}", total_deleted);
+//! ```
+//!
+//! ## Custom Parameters
+//!
+//! ```
+//! use spray::{SprayList, SprayParams};
+//!
+//! // Create custom parameters for smaller lists
+//! let params = SprayParams {
+//!     spray_base: 16,     // Reduce spray width
+//!     spray_height: 10,   // Reduce spray height
+//!     ..Default::default()
+//! };
+//!
+//! let spray: SprayList<i32, String> = SprayList::with_params(params);
+//! ```
+//!
+//! ## Implementation Details
+//!
+//! The `SprayList` uses a "spray" operation for `DeleteMin` that performs a randomized
+//! walk through the skip list:
+//!
+//! 1. **Random Walk**: Start from a random height and walk right for a random distance
+//! 2. **Multi-level Traversal**: Move down levels while continuing the random walk
+//! 3. **Collision Avoidance**: Different threads likely delete different elements
+//! 4. **Fallback**: Occasionally fall back to exact minimum deletion
+//!
+//! This approach distributes deletions across the front portion of the queue,
+//! dramatically reducing contention compared to always deleting from the exact head.
 
 use crate::rng::MarsagliaXOR;
 use crate::skiplist::{is_marked, unmark, Node, SkipList};
@@ -6,27 +153,110 @@ use std::cell::RefCell;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::Arc;
 
-/// Parameters for the spray operation
-/// These match the C implementation's configurable parameters
+/// Configuration parameters for the spray operation in `SprayList` .
+///
+/// These parameters control the behavior of the spray traversal algorithm,
+/// which is used to select elements for deletion in a way that reduces
+/// contention between threads. The parameters match those described in
+/// the original `SprayList` paper and C implementation.
+///
+/// # Examples
+///
+/// ```
+/// use spray::SprayParams;
+///
+/// // Create default parameters
+/// let params = SprayParams::default();
+///
+/// // Create custom parameters for small lists
+/// let custom_params = SprayParams {
+///     spray_base: 16,
+///     spray_height: 10,
+///     ..Default::default()
+/// };
+/// ```
 #[derive(Clone)]
 pub struct SprayParams {
-    /// Base parameter for spray width (D in the paper)
+    /// Base parameter for spray width (D in the paper).
+    ///
+    /// This controls the maximum number of steps the spray traversal
+    /// can take at each level. Larger values increase the spray width,
+    /// reducing contention but potentially increasing the deviation
+    /// from strict priority ordering.
+    ///
+    /// Default: 32
     pub spray_base: usize,
-    /// Height parameter (H in the paper)
+
+    /// Height parameter (H in the paper).
+    ///
+    /// This controls the maximum height from which spray traversal
+    /// can begin. Higher values allow for wider spray ranges but
+    /// may increase traversal time.
+    ///
+    /// Default: 20
     pub spray_height: usize,
-    /// Number of attempts before giving up
+
+    /// Maximum number of attempts before giving up on an operation.
+    ///
+    /// This prevents infinite loops in case of high contention or
+    /// implementation issues. If an operation fails this many times,
+    /// it will return None.
+    ///
+    /// Default: 100
     pub max_attempts: usize,
-    /// Height to start spray traversal (SCANHEIGHT in C)
+
+    /// Function to determine the height to start spray traversal (SCANHEIGHT in C).
+    ///
+    /// Takes the number of threads as input and returns the starting height
+    /// for the spray traversal. The default implementation returns
+    /// `floor(log2(n)) + 1` where n is the number of threads.
+    ///
+    /// Default: `|n| floor_log_2(n) + 1`
     pub scan_height_fn: fn(usize) -> usize,
-    /// Maximum scan length at top level (SCANMAX in C)
+
+    /// Function to determine maximum scan length at the top level (SCANMAX in C).
+    ///
+    /// Takes the number of threads as input and returns the maximum number
+    /// of steps to take during spray traversal at the highest level.
+    ///
+    /// Default: `|n| floor_log_2(n) + 1`
     pub scan_max_fn: fn(usize) -> usize,
-    /// Amount to increase scan length at each level (SCANINC in C)
+
+    /// Amount to increase scan length at each level during traversal (SCANINC in C).
+    ///
+    /// This value is added to the scan length as the traversal moves down
+    /// levels in the skip list. Higher values increase the spray width
+    /// at lower levels.
+    ///
+    /// Default: 0
     pub scan_increment: usize,
-    /// Number of levels to skip at each step (SCANSKIP in C)
+
+    /// Number of levels to skip at each step during traversal (SCANSKIP in C).
+    ///
+    /// This controls how many levels the spray traversal skips when moving
+    /// downward. Larger values result in coarser traversal but faster
+    /// descent through the skip list levels.
+    ///
+    /// Default: 1
     pub scan_skip: usize,
-    /// Enable fallback to exact deletemin with probability 1/n
+
+    /// Enable fallback to exact deletemin with probability 1/n.
+    ///
+    /// When enabled, each `delete_min` operation has a probability of 1/n
+    /// (where n is the number of threads) of falling back to an exact
+    /// minimum deletion instead of using spray. This helps maintain some
+    /// ordering guarantees while preserving most of the performance benefits.
+    ///
+    /// Default: true
     pub enable_fallback: bool,
-    /// Enable collision tracking
+
+    /// Enable collision tracking and statistics.
+    ///
+    /// When enabled, the implementation tracks collisions and other
+    /// statistics that can be useful for debugging and performance analysis.
+    /// Currently not fully implemented in this version.
+    ///
+    /// Default: true
     pub track_collisions: bool,
 }
 
@@ -55,7 +285,53 @@ const fn floor_log_2(n: usize) -> usize {
     }
 }
 
-/// A scalable relaxed priority queue
+/// A scalable relaxed priority queue based on the `SprayList` algorithm.
+///
+/// `SprayList` is a concurrent data structure that provides high-performance
+/// priority queue operations with relaxed ordering semantics. Instead of
+/// always returning the exact minimum element, `delete_min()` returns an
+/// element from among the first O(p log³ p) elements, where p is the
+/// number of threads.
+///
+/// This relaxation allows for much better scaling under concurrent access
+/// compared to traditional priority queues, which typically become bottlenecks
+/// as contention increases.
+///
+/// # Examples
+///
+/// ```
+/// use spray::SprayList;
+/// use std::sync::Arc;
+/// use std::thread;
+///
+/// // Basic usage
+/// let spray = SprayList::new();
+/// spray.insert(&5, &"five");
+/// spray.insert(&1, &"one");
+/// spray.insert(&3, &"three");
+///
+/// // Delete min may not return exact minimum due to relaxed semantics
+/// if let Some((key, value)) = spray.delete_min() {
+///     println!("Deleted: {} -> {}", key, value);
+/// }
+///
+/// // Concurrent usage
+/// let spray = Arc::new(SprayList::new());
+/// spray.set_num_threads(4); // Optimize for 4 threads
+///
+/// let mut handles = vec![];
+/// for i in 0..4 {
+///     let spray_clone = spray.clone();
+///     let handle = thread::spawn(move || {
+///         spray_clone.insert(&i, &format!("thread-{}", i));
+///     });
+///     handles.push(handle);
+/// }
+///
+/// for handle in handles {
+///     handle.join().unwrap();
+/// }
+/// ```
 pub struct SprayList<K, V> {
     /// The underlying skiplist
     skiplist: Arc<SkipList<K, V>>,
@@ -70,13 +346,48 @@ impl<
         V: Default + Clone + Send + Sync + 'static,
     > SprayList<K, V>
 {
-    /// Create a new `SprayList`
+    /// Creates a new empty `SprayList` with default parameters.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use spray::SprayList;
+    ///
+    /// let spray: SprayList<i32, String> = SprayList::new();
+    /// assert!(spray.is_empty());
+    /// assert_eq!(spray.len(), 0);
+    /// ```
     #[must_use]
     pub fn new() -> Self {
         Self::with_params(SprayParams::default())
     }
 
-    /// Create a new `SprayList` with custom parameters
+    /// Creates a new empty `SprayList` with custom spray parameters.
+    ///
+    /// This allows fine-tuning the spray behavior for specific use cases.
+    /// For example, smaller lists might benefit from reduced spray parameters,
+    /// while larger lists under high contention might benefit from increased
+    /// spray width.
+    ///
+    /// # Arguments
+    ///
+    /// * `params` - Custom spray parameters to control the algorithm behavior
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use spray::{SprayList, SprayParams};
+    ///
+    /// // Create parameters optimized for small lists
+    /// let params = SprayParams {
+    ///     spray_base: 16,
+    ///     spray_height: 10,
+    ///     ..Default::default()
+    /// };
+    ///
+    /// let spray: SprayList<i32, String> = SprayList::with_params(params);
+    /// assert!(spray.is_empty());
+    /// ```
     #[must_use]
     pub fn with_params(params: SprayParams) -> Self {
         Self {
@@ -86,18 +397,143 @@ impl<
         }
     }
 
-    /// Set the number of threads (for parameter tuning)
+    /// Sets the expected number of concurrent threads for parameter tuning.
+    ///
+    /// This hint is used to optimize the spray parameters for the expected
+    /// level of concurrency. The spray width is typically O(p log³ p) where
+    /// p is the number of threads, so providing an accurate thread count
+    /// helps optimize performance.
+    ///
+    /// # Arguments
+    ///
+    /// * `num_threads` - The expected number of threads that will access this `SprayList`
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use spray::SprayList;
+    /// use std::sync::Arc;
+    /// use std::thread;
+    ///
+    /// let spray: Arc<SprayList<i32, String>> = Arc::new(SprayList::new());
+    /// spray.set_num_threads(4); // Optimize for 4 threads
+    ///
+    /// // Now use the spray list with 4 threads...
+    /// ```
     pub fn set_num_threads(&self, num_threads: usize) {
         self.num_threads.store(num_threads, AtomicOrdering::Relaxed);
     }
 
-    /// Insert a key-value pair
+    /// Inserts a key-value pair into the `SprayList`.
+    ///
+    /// If the key already exists, the insertion fails and returns `false`.
+    /// Otherwise, the key-value pair is inserted and `true` is returned.
+    ///
+    /// This operation is thread-safe and lock-free.
+    ///
+    /// # Arguments
+    ///
+    /// * `key` - The key to insert (must implement `Ord`)
+    /// * `value` - The value to associate with the key
+    ///
+    /// # Returns
+    ///
+    /// `true` if the insertion was successful, `false` if the key already exists.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use spray::SprayList;
+    ///
+    /// let spray = SprayList::new();
+    ///
+    /// // Insert some values
+    /// assert!(spray.insert(&1, &"one"));
+    /// assert!(spray.insert(&2, &"two"));
+    ///
+    /// // Duplicate key fails
+    /// assert!(!spray.insert(&1, &"ONE"));
+    ///
+    /// assert_eq!(spray.len(), 2);
+    /// ```
     pub fn insert(&self, key: &K, value: &V) -> bool {
         self.skiplist.insert(key, value)
     }
 
-    /// Delete and return an element from near the minimum
-    /// This is the key operation that uses the spray mechanism
+    /// Removes and returns an element from near the minimum of the `SprayList`.
+    ///
+    /// This is the core operation that implements the spray mechanism. Unlike
+    /// traditional priority queues that always return the exact minimum,
+    /// `delete_min()` returns an element from among the first O(p log³ p)
+    /// smallest elements, where p is the number of threads.
+    ///
+    /// This relaxed semantic allows for much better concurrent performance
+    /// by reducing contention between threads. With probability 1/p, the
+    /// operation falls back to exact minimum deletion to maintain some
+    /// ordering guarantees.
+    ///
+    /// # Returns
+    ///
+    /// `Some((key, value))` if an element was successfully removed, or `None`
+    /// if the list is empty or if contention prevented deletion.
+    ///
+    /// # Thread Safety
+    ///
+    /// This operation is thread-safe and lock-free. Multiple threads can
+    /// call `delete_min()` concurrently.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use spray::SprayList;
+    ///
+    /// let spray = SprayList::new();
+    /// spray.insert(&5, &"five");
+    /// spray.insert(&1, &"one");
+    /// spray.insert(&3, &"three");
+    /// spray.insert(&7, &"seven");
+    ///
+    /// // May not return the exact minimum due to relaxed ordering
+    /// while let Some((key, value)) = spray.delete_min() {
+    ///     println!("Removed: {} -> {}", key, value);
+    /// }
+    /// ```
+    ///
+    /// # Concurrent Example
+    ///
+    /// ```
+    /// use spray::SprayList;
+    /// use std::sync::Arc;
+    /// use std::thread;
+    ///
+    /// let spray = Arc::new(SprayList::new());
+    /// spray.set_num_threads(2);
+    ///
+    /// // Insert values
+    /// for i in 0..100 {
+    ///     spray.insert(&i, &format!("value-{}", i));
+    /// }
+    ///
+    /// // Multiple threads can delete concurrently
+    /// let mut handles = vec![];
+    /// for _ in 0..2 {
+    ///     let spray_clone = spray.clone();
+    ///     let handle = thread::spawn(move || {
+    ///         let mut count = 0;
+    ///         while spray_clone.delete_min().is_some() {
+    ///             count += 1;
+    ///         }
+    ///         count
+    ///     });
+    ///     handles.push(handle);
+    /// }
+    ///
+    /// let total_deleted: usize = handles.into_iter()
+    ///     .map(|h| h.join().unwrap())
+    ///     .sum();
+    ///
+    /// println!("Total deleted: {}", total_deleted);
+    /// ```
     pub fn delete_min(&self) -> Option<(K, V)> {
         let n = self.num_threads.load(AtomicOrdering::Relaxed).max(1);
 
@@ -154,7 +590,7 @@ impl<
 
                 // Step right at current level
                 while scan_len > 0 {
-                    let next_ptr = unsafe { &*current }.next[level].load(AtomicOrdering::SeqCst);
+                    let next_ptr = unsafe { &*current }.next[level].load(AtomicOrdering::Acquire);
 
                     if next_ptr.is_null() {
                         break;
@@ -169,14 +605,14 @@ impl<
 
                     // Only decrement scan_len if node is not deleted
                     let node = unsafe { &*current };
-                    if !is_marked(node.next[0].load(AtomicOrdering::SeqCst)) {
+                    if !is_marked(node.next[0].load(AtomicOrdering::Acquire)) {
                         scan_len -= 1;
                     }
                 }
 
                 // Check if we've reached the end
                 if unsafe { &*current }.next[0]
-                    .load(AtomicOrdering::SeqCst)
+                    .load(AtomicOrdering::Acquire)
                     .is_null()
                 {
                     return None; // Empty list
@@ -199,7 +635,7 @@ impl<
             // Find first non-deleted node
             while !current.is_null() {
                 let node = unsafe { &*current };
-                let next_ptr = node.next[0].load(AtomicOrdering::SeqCst);
+                let next_ptr = node.next[0].load(AtomicOrdering::Acquire);
 
                 if !is_marked(next_ptr) {
                     // Node is not deleted
@@ -262,7 +698,7 @@ impl<
         for level in (0..=node.level).rev() {
             // Find predecessors at this level
             let mut pred = self.skiplist.head();
-            let mut curr = unsafe { &*pred }.next[level].load(AtomicOrdering::SeqCst);
+            let mut curr = unsafe { &*pred }.next[level].load(AtomicOrdering::Acquire);
 
             // Search for the node at this level
             while !curr.is_null() && curr != node_ptr {
@@ -273,30 +709,30 @@ impl<
                 let curr_node = unsafe { &*curr_clean };
 
                 // Skip marked nodes
-                if is_marked(curr_node.next[level].load(AtomicOrdering::SeqCst)) {
-                    let next = unmark(curr_node.next[level].load(AtomicOrdering::SeqCst));
+                if is_marked(curr_node.next[level].load(AtomicOrdering::Acquire)) {
+                    let next = unmark(curr_node.next[level].load(AtomicOrdering::Acquire));
                     let _ = unsafe { &*pred }.next[level].compare_exchange(
                         curr,
                         next,
-                        AtomicOrdering::SeqCst,
-                        AtomicOrdering::SeqCst,
+                        AtomicOrdering::AcqRel,
+                        AtomicOrdering::Acquire,
                     );
                     curr = next;
                     continue;
                 }
 
                 pred = curr_clean;
-                curr = curr_node.next[level].load(AtomicOrdering::SeqCst);
+                curr = curr_node.next[level].load(AtomicOrdering::Acquire);
             }
 
             // If we found the node, try to unlink it
             if curr == node_ptr {
-                let next = unmark(node.next[level].load(AtomicOrdering::SeqCst));
+                let next = unmark(node.next[level].load(AtomicOrdering::Acquire));
                 let _ = unsafe { &*pred }.next[level].compare_exchange(
                     curr,
                     next,
-                    AtomicOrdering::SeqCst,
-                    AtomicOrdering::SeqCst,
+                    AtomicOrdering::AcqRel,
+                    AtomicOrdering::Acquire,
                 );
             }
         }
@@ -320,7 +756,7 @@ impl<
                 return None;
             }
 
-            let first = unsafe { &*head }.next[0].load(AtomicOrdering::SeqCst);
+            let first = unsafe { &*head }.next[0].load(AtomicOrdering::Acquire);
             if first.is_null() {
                 return None;
             }
@@ -347,17 +783,85 @@ impl<
         }
     }
 
-    /// Get the current size of the `SprayList`
+    /// Returns the number of elements currently in the `SprayList`.
+    ///
+    /// This operation is thread-safe but the returned value represents
+    /// a snapshot at the time of the call. In concurrent environments,
+    /// the actual size may change immediately after this call returns.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use spray::SprayList;
+    ///
+    /// let spray = SprayList::new();
+    /// assert_eq!(spray.len(), 0);
+    ///
+    /// spray.insert(&1, &"one");
+    /// spray.insert(&2, &"two");
+    /// assert_eq!(spray.len(), 2);
+    ///
+    /// spray.delete_min();
+    /// assert_eq!(spray.len(), 1);
+    /// ```
     pub fn len(&self) -> usize {
         self.skiplist.len()
     }
 
-    /// Check if the `SprayList` is empty
+    /// Returns `true` if the `SprayList` contains no elements.
+    ///
+    /// This is equivalent to checking if `len() == 0`, but may be
+    /// slightly more efficient.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use spray::SprayList;
+    ///
+    /// let spray = SprayList::new();
+    /// assert!(spray.is_empty());
+    ///
+    /// spray.insert(&1, &"one");
+    /// assert!(!spray.is_empty());
+    ///
+    /// spray.delete_min();
+    /// assert!(spray.is_empty());
+    /// ```
     pub fn is_empty(&self) -> bool {
         self.skiplist.is_empty()
     }
 
-    /// Find the minimum key without removing it
+    /// Returns the minimum key without removing it from the `SprayList`.
+    ///
+    /// Unlike `delete_min()`, this operation does not use the spray mechanism
+    /// and always returns the actual minimum key if the list is non-empty.
+    /// This operation does not modify the `SprayList`.
+    ///
+    /// # Returns
+    ///
+    /// `Some(key)` containing the minimum key, or `None` if the list is empty.
+    ///
+    /// # Thread Safety
+    ///
+    /// This operation is thread-safe, but in concurrent environments, the
+    /// minimum key may change immediately after this call returns.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use spray::SprayList;
+    ///
+    /// let spray = SprayList::new();
+    /// assert_eq!(spray.peek_min(), None);
+    ///
+    /// spray.insert(&5, &"five");
+    /// spray.insert(&1, &"one");
+    /// spray.insert(&3, &"three");
+    ///
+    /// // Always returns the actual minimum
+    /// assert_eq!(spray.peek_min(), Some(1));
+    /// assert_eq!(spray.len(), 3); // List unchanged
+    /// ```
     pub fn peek_min(&self) -> Option<K> {
         let head = self.skiplist.head();
 
@@ -365,7 +869,7 @@ impl<
             return None;
         }
 
-        let first = unsafe { &*head }.next[0].load(AtomicOrdering::SeqCst);
+        let first = unsafe { &*head }.next[0].load(AtomicOrdering::Acquire);
         if first.is_null() {
             return None;
         }
