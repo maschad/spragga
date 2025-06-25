@@ -50,11 +50,8 @@ Use traditional priority queues when:
 
 ## Usage
 
-Add this to your `Cargo.toml`:
-
-```toml
-[dependencies]
-spragga = "1.0.0"
+```console
+cargo add spragga
 ```
 
 ### Basic Example
