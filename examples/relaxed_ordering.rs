@@ -1,4 +1,4 @@
-use spray::SprayList;
+use spragga::SprayList;
 use std::collections::HashMap;
 #[allow(clippy::cast_precision_loss)]
 fn main() {

@@ -51,7 +51,7 @@
 //! ## Basic Example
 //!
 //! ```
-//! use spray::SprayList;
+//! use spragga::SprayList;
 //!
 //! let spray = SprayList::new();
 //!
@@ -70,7 +70,7 @@
 //! ## Concurrent Example
 //!
 //! ```
-//! use spray::SprayList;
+//! use spragga::SprayList;
 //! use std::sync::Arc;
 //! use std::thread;
 //!
@@ -122,7 +122,7 @@
 //! ## Custom Parameters
 //!
 //! ```
-//! use spray::{SprayList, SprayParams};
+//! use spragga::{SprayList, SprayParams};
 //!
 //! // Create custom parameters for smaller lists
 //! let params = SprayParams {
@@ -163,7 +163,7 @@ use std::sync::Arc;
 /// # Examples
 ///
 /// ```
-/// use spray::SprayParams;
+/// use spragga::SprayParams;
 ///
 /// // Create default parameters
 /// let params = SprayParams::default();
@@ -300,7 +300,7 @@ const fn floor_log_2(n: usize) -> usize {
 /// # Examples
 ///
 /// ```
-/// use spray::SprayList;
+/// use spragga::SprayList;
 /// use std::sync::Arc;
 /// use std::thread;
 ///
@@ -351,7 +351,7 @@ impl<
     /// # Examples
     ///
     /// ```
-    /// use spray::SprayList;
+    /// use spragga::SprayList;
     ///
     /// let spray: SprayList<i32, String> = SprayList::new();
     /// assert!(spray.is_empty());
@@ -376,7 +376,7 @@ impl<
     /// # Examples
     ///
     /// ```
-    /// use spray::{SprayList, SprayParams};
+    /// use spragga::{SprayList, SprayParams};
     ///
     /// // Create parameters optimized for small lists
     /// let params = SprayParams {
@@ -411,7 +411,7 @@ impl<
     /// # Examples
     ///
     /// ```
-    /// use spray::SprayList;
+    /// use spragga::SprayList;
     /// use std::sync::Arc;
     /// use std::thread;
     ///
@@ -443,7 +443,7 @@ impl<
     /// # Examples
     ///
     /// ```
-    /// use spray::SprayList;
+    /// use spragga::SprayList;
     ///
     /// let spray = SprayList::new();
     ///
@@ -485,7 +485,7 @@ impl<
     /// # Examples
     ///
     /// ```
-    /// use spray::SprayList;
+    /// use spragga::SprayList;
     ///
     /// let spray = SprayList::new();
     /// spray.insert(&5, &"five");
@@ -502,7 +502,7 @@ impl<
     /// # Concurrent Example
     ///
     /// ```
-    /// use spray::SprayList;
+    /// use spragga::SprayList;
     /// use std::sync::Arc;
     /// use std::thread;
     ///
@@ -792,7 +792,7 @@ impl<
     /// # Examples
     ///
     /// ```
-    /// use spray::SprayList;
+    /// use spragga::SprayList;
     ///
     /// let spray = SprayList::new();
     /// assert_eq!(spray.len(), 0);
@@ -816,7 +816,7 @@ impl<
     /// # Examples
     ///
     /// ```
-    /// use spray::SprayList;
+    /// use spragga::SprayList;
     ///
     /// let spray = SprayList::new();
     /// assert!(spray.is_empty());
@@ -849,7 +849,7 @@ impl<
     /// # Examples
     ///
     /// ```
-    /// use spray::SprayList;
+    /// use spragga::SprayList;
     ///
     /// let spray = SprayList::new();
     /// assert_eq!(spray.peek_min(), None);

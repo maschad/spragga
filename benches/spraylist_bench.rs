@@ -8,7 +8,7 @@
 #![allow(clippy::semicolon_if_nothing_returned)]
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
-use spray::{SprayList, SprayParams};
+use spragga::{SprayList, SprayParams};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier};
 use std::thread;
@@ -119,7 +119,7 @@ fn run_throughput_benchmark(config: BenchConfig) -> PerfMetrics {
         let handle = thread::spawn(move || {
             barrier_clone.wait(); // Synchronize start
 
-            let mut rng = spray::rng::MarsagliaXOR::new((thread_id as u32).wrapping_mul(31) + 1);
+            let mut rng = spragga::rng::MarsagliaXOR::new((thread_id as u32).wrapping_mul(31) + 1);
             let thread_start = Instant::now();
             let ops_per_thread = thread_config.total_ops / thread_config.num_threads;
             let mut local_ops = 0;

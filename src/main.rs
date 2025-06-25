@@ -1,4 +1,4 @@
-use spray::SprayList;
+use spragga::SprayList;
 use std::sync::Arc;
 use std::thread;
 use std::time::Instant;

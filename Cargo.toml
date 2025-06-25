@@ -5,8 +5,8 @@ description = "A scalable concurrent priority queue with relaxed ordering semant
 edition     = "2021"
 keywords    = ["priority-queue", "concurrent", "lock-free", "data-structures", "skip-list"]
 license     = "MIT"
-name        = "spray"
-repository  = "https://github.com/maschad/spray"
+name        = "spragga"
+repository  = "https://github.com/maschad/spragga"
 version     = "1.0.0"
 
 [dev-dependencies]
