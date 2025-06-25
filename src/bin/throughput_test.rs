@@ -1,4 +1,4 @@
-use spray::SprayList;
+use spragga::SprayList;
 use std::env;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier};
@@ -57,7 +57,7 @@ fn run_throughput_test(config: TestConfig) -> f64 {
         let handle = thread::spawn(move || {
             barrier_clone.wait(); // Synchronize start
 
-            let mut rng = spray::rng::MarsagliaXOR::new(
+            let mut rng = spragga::rng::MarsagliaXOR::new(
                 u32::try_from(thread_id).unwrap().wrapping_mul(31) + 1,
             );
             let thread_start = Instant::now();

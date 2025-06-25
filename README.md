@@ -1,4 +1,4 @@
-# Spray
+# Spragga
 
 A Rust implementation of the SprayList data structure - a scalable concurrent priority queue with relaxed ordering semantics.
 
@@ -54,13 +54,13 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-spray = "1.0.0"
+spragga = "1.0.0"
 ```
 
 ### Basic Example
 
 ```rust
-use spray::SprayList;
+use spragga::SprayList;
 
 fn main() {
     // Create a new SprayList
@@ -82,7 +82,7 @@ fn main() {
 ### Concurrent Example
 
 ```rust
-use spray::SprayList;
+use spragga::SprayList;
 use std::sync::Arc;
 use std::thread;
 

@@ -395,7 +395,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "spray"
+name = "spragga"
 version = "1.0.0"
 dependencies = [
  "criterion",
