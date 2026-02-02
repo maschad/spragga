@@ -16,7 +16,7 @@ pub struct Node<K, V> {
     pub key: K,
     pub value: V,
     pub level: usize,
-    pub next: Vec<AtomicPtr<Node<K, V>>>,
+    pub next: Vec<AtomicPtr<Self>>,
 }
 
 impl<K, V> Node<K, V> {

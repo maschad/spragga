@@ -1,6 +1,5 @@
 use spragga::SprayList;
 use std::env;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::Instant;
@@ -41,17 +40,16 @@ fn run_throughput_test(config: TestConfig) -> f64 {
         spray.insert(&(i as i32), &format!("initial-{i}"));
     }
 
-    let barrier = Arc::new(Barrier::new(config.num_threads));
-    let total_ops = Arc::new(AtomicUsize::new(0));
+    // Use an extra barrier participant (the main thread) so we can start timing
+    // after all worker threads are ready, without a shared atomic counter
+    // becoming the bottleneck.
+    let barrier = Arc::new(Barrier::new(config.num_threads + 1));
     let mut handles = vec![];
-
-    let start_time = Instant::now();
 
     // Spawn worker threads
     for thread_id in 0..config.num_threads {
         let spray_clone = spray.clone();
         let barrier_clone = barrier.clone();
-        let total_ops_clone = total_ops.clone();
         let thread_config = config.clone();
 
         let handle = thread::spawn(move || {
@@ -86,21 +84,26 @@ fn run_throughput_test(config: TestConfig) -> f64 {
                     let _ = spray_clone.peek_min();
                 }
 
-                total_ops_clone.fetch_add(1, Ordering::Relaxed);
                 local_ops += 1;
             }
+
+            local_ops
         });
 
         handles.push(handle);
     }
 
+    // Release all threads at once and start timing.
+    barrier.wait();
+    let start_time = Instant::now();
+
     // Wait for all threads to complete
+    let mut ops_completed: usize = 0;
     for handle in handles {
-        handle.join().unwrap();
+        ops_completed += handle.join().unwrap();
     }
 
     let duration = start_time.elapsed();
-    let ops_completed = total_ops.load(Ordering::Relaxed);
     ops_completed as f64 / duration.as_secs_f64()
 }
 
@@ -178,7 +181,8 @@ fn main() {
                 let mut test_config = config.clone();
                 test_config.num_threads = num_threads;
                 let throughput = run_throughput_test(test_config);
-                println!("{throughput:.0},{num_threads}");
+                // Match the header: threads first, throughput second.
+                println!("{num_threads},{throughput:.0}");
             }
         } else {
             println!("SprayList Scaling Test");

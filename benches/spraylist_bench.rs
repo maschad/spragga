@@ -3,9 +3,6 @@
 #![allow(clippy::cast_possible_wrap)]
 #![allow(clippy::semicolon_if_nothing_returned)]
 #![allow(clippy::needless_pass_by_value)]
-#![allow(clippy::cast_possible_truncation)]
-#![allow(clippy::cast_possible_wrap)]
-#![allow(clippy::semicolon_if_nothing_returned)]
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use spragga::{SprayList, SprayParams};
